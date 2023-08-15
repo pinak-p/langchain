@@ -1,13 +1,14 @@
 import json
-import os
 import multiprocessing as mp
+import os
 from functools import partial
 from typing import Any, Dict, List, Optional
 
+import boto3
 from pydantic import BaseModel, Extra, root_validator
 
 from langchain.embeddings.base import Embeddings
-import boto3
+
 
 class BedrockEmbeddings(BaseModel, Embeddings):
     """Bedrock embedding models.
@@ -73,14 +74,13 @@ class BedrockEmbeddings(BaseModel, Embeddings):
     @root_validator()
     def validate_environment(cls, values: Dict) -> Dict:
         """Validate that AWS credentials to and python package exists in environment."""
-        
+
         if values["client"] is not None:
             values["region_name"] = values["client"].meta.region_name
             values["endpoint_url"] = values["client"].meta.endpoint_url
             return values
 
         try:
-
             if values["credentials_profile_name"] is not None:
                 session = boto3.Session(profile_name=values["credentials_profile_name"])
             else:
@@ -109,7 +109,7 @@ class BedrockEmbeddings(BaseModel, Embeddings):
                 "Please check that credentials in the specified "
                 "profile name are valid."
             ) from e
-        
+
         return values
 
     def _embedding_func(self, text: str) -> List[float]:
@@ -156,47 +156,60 @@ class BedrockEmbeddings(BaseModel, Embeddings):
 
     def _embedding_multiprocessing_func(self, text: str) -> List[float]:
         """Call out to Bedrock embeddings endpoint. This has the same functionality as
-        _embedding_func() except that it creates a boto3 bedrock client rather than 
+        _embedding_func() except that it creates a boto3 bedrock client rather than
         using the class's member variable (this is needed for multiprocessing because the
-        boto3 client object cannot be pickled).
+        boto3 session objects are not thread safe - https://boto3.amazonaws.com/v1/documentation/api/latest/guide/session.html#multithreading-or-multiprocessing-with-sessions).
         """
-        
+
         # replace newlines, which can negatively affect performance.
         text = text.replace(os.linesep, " ")
         model_kwargs = self.model_kwargs or {}
 
         input_body = {**model_kwargs, "inputText": text}
         body = json.dumps(input_body)
-        
-        client_kwargs = {}
-        
-        if self.region_name:
-            client_kwargs['region_name'] = self.region_name
-        
-        if self.endpoint_url:
-            client_kwargs['endpoint_url'] = self.endpoint_url
 
-        bedrock = boto3.client(
-                    service_name='bedrock',
-                    **client_kwargs
-                    )
+        client_kwargs = {}
+
+        if self.region_name:
+            client_kwargs["region_name"] = self.region_name
+
+        if self.endpoint_url:
+            client_kwargs["endpoint_url"] = self.endpoint_url
+
+        bedrock = boto3.client(service_name="bedrock", **client_kwargs)
         try:
             response = bedrock.invoke_model(
-                    body=body,
-                    modelId=self.model_id,
-                    accept="application/json",
-                    contentType="application/json",
-                )
+                body=body,
+                modelId=self.model_id,
+                accept="application/json",
+                contentType="application/json",
+            )
             response_body = json.loads(response.get("body").read())
 
             embedding = response_body.get("embedding")
-            return embedding
         except Exception as e:
-            raise ValueError(f"Error raised by inference endpoint: {e}")
-        
+            if e.response["Error"]["Code"] == "ThrottlingException":
+                # sleep before retry
+                time.sleep(0.1)
+
+                try:
+                    response = bedrock.invoke_model(
+                        body=body,
+                        modelId=self.model_id,
+                        accept="application/json",
+                        contentType="application/json",
+                    )
+                    response_body = json.loads(response.get("body").read())
+                    embedding = response_body.get("embedding")
+                except Exception as e:
+                    raise ValueError(f"Error raised by inference endpoint: {e}")
+            else:
+                raise ValueError(f"Error raised by inference endpoint: {e}")
+
+        return embedding
+
     def embed_documents_multiprocessing(
-            self, texts: List[str],
-            num_jobs: int = mp.cpu_count()
+        self, texts: List[str], num_jobs: int = mp.cpu_count()
     ) -> List[List[float]]:
         """
         Compute embeddings for texts using multiprocessing.
@@ -210,7 +223,7 @@ class BedrockEmbeddings(BaseModel, Embeddings):
 
         """
 
-        # The client object cannot be pickled (needed for multiprocessing to work), 
+        # The client object cannot be pickled (needed for multiprocessing to work),
         # save the client object into a temporary variable and restore it later.
         # A new client object is now created inside each process. This class is not
         # re-entrant so this is ok.
@@ -222,13 +235,14 @@ class BedrockEmbeddings(BaseModel, Embeddings):
 
         # distribute the input list between the processes in the pool (the use of pool.imap
         # returns the output (embeddings) in the same order as the input texts)
-        embeddings = list(pool.imap(partial(self._embedding_multiprocessing_func), texts))
+        embeddings = list(
+            pool.imap(partial(self._embedding_multiprocessing_func), texts)
+        )
 
         # restore the client back
         self.client = client
-        
-        return embeddings
 
+        return embeddings
 
     def embed_query(self, text: str) -> List[float]:
         """Compute query embeddings using a Bedrock model.
